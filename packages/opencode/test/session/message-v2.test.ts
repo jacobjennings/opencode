@@ -1488,6 +1488,22 @@ describe("session.message-v2.fromError", () => {
     expect(JSON.stringify(result.data.metadata ?? {})).not.toContain(sentinel)
   })
 
+  test("only retries malformed streamed tool calls, not generic invalid response data", () => {
+    const malformed = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "{}" } }] },
+      message: "Expected 'function.name' to be a string.",
+    })
+    const generic = new InvalidResponseDataError({ data: { choices: [] }, message: "Response did not contain any choices." })
+
+    const retryable = MessageV2.fromError(malformed, { providerID })
+    expect(SessionV1.APIError.isInstance(retryable)).toBe(true)
+    if (SessionV1.APIError.isInstance(retryable)) expect(retryable.data.isRetryable).toBe(true)
+
+    const notRetryable = MessageV2.fromError(generic, { providerID })
+    expect(SessionV1.APIError.isInstance(notRetryable)).toBe(true)
+    if (SessionV1.APIError.isInstance(notRetryable)) expect(notRetryable.data.isRetryable).toBe(false)
+  })
+
   test("detects context overflow from APICallError provider messages", () => {
     const cases = [
       "prompt is too long: 213462 tokens > 200000 maximum",

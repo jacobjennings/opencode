@@ -729,7 +729,7 @@ export function fromError(
       return new APIError(
         {
           message: e.message,
-          isRetryable: true,
+          isRetryable: malformed,
           metadata: {
             code: malformed ? MALFORMED_TOOL_CALL_CODE : "invalid_response_data",
           },
