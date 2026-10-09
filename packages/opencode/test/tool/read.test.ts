@@ -764,6 +764,39 @@ describe("tool.read caps", () => {
       expect(Number(m![2])).toBe(entries.length + 1)
     }),
   )
+
+  it.instance("caps loaded instructions so the whole read result stays within 16 KB", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const dir = path.join(test.directory, "nested")
+      // 20,000 ASCII bytes of nested AGENTS.md next to a tiny 5-character file.
+      yield* put(path.join(dir, "AGENTS.md"), "x".repeat(20000))
+      yield* put(path.join(dir, "hello"), "hello")
+
+      const result = yield* run({ filePath: path.join(dir, "hello") })
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      expect(result.output).toContain("1: hello")
+      expect(result.output).not.toContain("Showing lines 1-0")
+      expect(result.output).toContain("Instructions truncated at 8 KB")
+    }),
+  )
+
+  it.instance("caps multibyte loaded instructions on code-point boundaries", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const dir = path.join(test.directory, "nested-mb")
+      // 7,000 three-byte code points (21 KB of UTF-8) pushed through the byte cap.
+      yield* put(path.join(dir, "AGENTS.md"), "界".repeat(7000))
+      yield* put(path.join(dir, "hello"), "hello")
+
+      const result = yield* run({ filePath: path.join(dir, "hello") })
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      expect(result.output).toContain("1: hello")
+      expect(result.output).not.toContain("Showing lines 1-0")
+      expect(result.output).toContain("Instructions truncated at 8 KB")
+      expect(result.output).not.toContain("\uFFFD")
+    }),
+  )
 })
 
 describe("tool.read loaded instructions", () => {
