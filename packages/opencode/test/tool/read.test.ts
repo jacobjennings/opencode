@@ -317,8 +317,9 @@ describe("tool.read truncation", () => {
     Effect.gen(function* () {
       const test = yield* TestInstance
       const base = yield* load(path.join(FIXTURES_DIR, "models-api.json"))
-      const target = 60 * 1024
-      const content = base.length >= target ? base : base.repeat(Math.ceil(target / base.length))
+      // 60 KB of 1 KB lines so the 16 KB byte cap is reached before the 400-line cap
+      const line = base.replace(/\s*\n/g, " ").slice(0, 1024)
+      const content = Array.from({ length: 60 }, () => line).join("\n")
       yield* put(path.join(test.directory, "large.json"), content)
 
       const result = yield* run({ filePath: path.join(test.directory, "large.json") })
@@ -563,6 +564,124 @@ root_type Monster;`
         expect(result.attachments).toBeUndefined()
         expect(result.output).toContain(item[1])
       }
+    }),
+  )
+})
+
+describe("tool.read caps", () => {
+  it.instance("cuts a file over the line cap with the notice and continue offset", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "many.txt")
+      yield* put(p, Array.from({ length: 500 }, (_, i) => `line${i + 1}`).join("\n"))
+
+      const result = yield* run({ filePath: p })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 1,
+        lineEnd: 400,
+        totalLines: 500,
+        truncated: true,
+      })
+      expect(result.output).toContain("400: line400")
+      expect(result.output).not.toContain("401: line401")
+      expect(result.output).toContain("Showing lines 1-400 of 500")
+      expect(result.output).toContain("Use offset=401")
+    }),
+  )
+
+  it.instance("cuts a file under the line cap when its bytes exceed 16 KB", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "wide.txt")
+      // One long line truncates to 2000 chars + 34 char suffix = 2034 bytes, then
+      // 60 medium lines of 250 chars. Each medium line costs 251 bytes, so
+      // floor((16384 - 2034) / 251) = 57 of them fit and the cut lands on line 59.
+      // totalLines counts lines scanned up to the stop, which is the cut line itself.
+      const lines = ["L".repeat(4000), ...Array.from({ length: 60 }, () => "m".repeat(250))]
+      yield* put(p, lines.join("\n"))
+
+      const result = yield* run({ filePath: p })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 1,
+        lineEnd: 58,
+        totalLines: 59,
+        truncated: true,
+      })
+      expect(result.output).toContain("Output capped at 16 KB. Showing lines 1-58. Use offset=59 to continue.")
+    }),
+  )
+
+  it.instance("returns a small file whole with no notice", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "small.txt")
+      yield* put(p, ["alpha", "beta", "gamma"].join("\n"))
+
+      const result = yield* run({ filePath: p })
+      expect(result.metadata.truncated).toBe(false)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 1,
+        lineEnd: 3,
+        totalLines: 3,
+        truncated: false,
+      })
+      expect(result.output).toContain("1: alpha")
+      expect(result.output).toContain("3: gamma")
+      expect(result.output).toContain("End of file - total 3 lines")
+      expect(result.output).not.toContain("Output capped at")
+      expect(result.output).not.toContain("Use offset=")
+    }),
+  )
+
+  it.instance("cuts an explicit limit above the line cap down to the line cap", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "bigger.txt")
+      yield* put(p, Array.from({ length: 800 }, (_, i) => `line${i + 1}`).join("\n"))
+
+      const result = yield* run({ filePath: p, limit: 5000 })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 1,
+        lineEnd: 400,
+        totalLines: 800,
+        truncated: true,
+      })
+      expect(result.output).toContain("400: line400")
+      expect(result.output).not.toContain("401: line401")
+      expect(result.output).toContain("Showing lines 1-400 of 800")
+      expect(result.output).toContain("Use offset=401")
+      expect(result.output).not.toContain("Output capped at")
+    }),
+  )
+
+  it.instance("honours an explicit offset and limit inside the caps", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "window.txt")
+      yield* put(p, Array.from({ length: 1000 }, (_, i) => `line${i + 1}`).join("\n"))
+
+      const result = yield* run({ filePath: p, offset: 100, limit: 50 })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 100,
+        lineEnd: 149,
+        totalLines: 1000,
+        truncated: true,
+      })
+      expect(result.output).toContain("100: line100")
+      expect(result.output).toContain("149: line149")
+      expect(result.output).not.toContain("99: line99")
+      expect(result.output).not.toContain("150: line150")
+      expect(result.output).toContain("Showing lines 100-149 of 1000")
+      expect(result.output).toContain("Use offset=150")
     }),
   )
 })
