@@ -135,7 +135,10 @@ export const ReadTool = Tool.define<
       )
     })
 
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
+    const lines = Effect.fn("ReadTool.lines")(function* (
+      filepath: string,
+      opts: { limit: number; offset: number; overhead: number },
+    ) {
       const start = opts.offset - 1
       const raw: string[] = []
       const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
@@ -161,8 +164,12 @@ export const ReadTool = Tool.define<
             }
 
             const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-            if (flags.bytes + size <= MAX_BYTES) {
+            // The byte cap applies to the full returned output, so budget the
+            // numbered line and keep `overhead` reserved for the wrapper, the
+            // truncation notice, and any loaded instructions.
+            const numbered = `${opts.offset + raw.length}: ${line}`
+            const size = Buffer.byteLength(numbered, "utf-8") + (raw.length > 0 ? 1 : 0)
+            if (flags.bytes + size <= MAX_BYTES - opts.overhead) {
               raw.push(line)
               flags.bytes += size
               return
@@ -267,7 +274,29 @@ export const ReadTool = Tool.define<
         const limit = Math.min(params.limit ?? DEFAULT_READ_LIMIT, MAX_READ_LINES)
         const offset = params.offset || 1
         const start = offset - 1
-        const sliced = items.slice(start, start + limit)
+        // The byte cap applies to the full returned output, so reserve the
+        // wrapper and the truncation notice, then cut on whole entries.
+        const fixed =
+          Buffer.byteLength([`<path>${filepath}</path>`, `<type>directory</type>`, "<entries>\n"].join("\n"), "utf-8") +
+          1 +
+          1 +
+          Buffer.byteLength("</entries>", "utf-8")
+        const noticeReserve = Math.max(
+          Buffer.byteLength(
+            `\n(Showing ${limit} of 10000000000 entries. Use offset=${offset + limit} to continue.)`,
+            "utf-8",
+          ),
+          Buffer.byteLength(`\n(10000000000 entries)`, "utf-8"),
+        )
+        const budget = MAX_BYTES - fixed - noticeReserve
+        const sliced: string[] = []
+        let entryBytes = 0
+        for (const item of items.slice(start, start + limit)) {
+          const size = Buffer.byteLength(item, "utf-8") + (sliced.length > 0 ? 1 : 0)
+          if (entryBytes + size > budget) break
+          sliced.push(item)
+          entryBytes += size
+        }
         const truncated = start + sliced.length < items.length
 
         return {
@@ -278,7 +307,7 @@ export const ReadTool = Tool.define<
             `<entries>`,
             sliced.join("\n"),
             truncated
-              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
+              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use offset=${offset + sliced.length} to continue.)`
               : `\n(${items.length} entries)`,
             `</entries>`,
           ].join("\n"),
@@ -329,10 +358,33 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file = yield* lines(filepath, {
-        limit: Math.min(params.limit ?? DEFAULT_READ_LIMIT, MAX_READ_LINES),
-        offset: params.offset || 1,
-      })
+      const limit = Math.min(params.limit ?? DEFAULT_READ_LIMIT, MAX_READ_LINES)
+      const offset = params.offset || 1
+      // Reserve room in the byte budget for everything appended around the
+      // numbered content: the wrapper, the truncation notice (widest case), and
+      // any loaded instructions, so the full output stays within MAX_BYTES.
+      const header = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      const instructions =
+        loaded.length > 0
+          ? `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
+          : ""
+      const noticeReserve = Math.max(
+        Buffer.byteLength(
+          `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${offset}-${offset + limit - 1}. Use offset=${offset + limit} to continue.)`,
+          "utf-8",
+        ),
+        Buffer.byteLength(
+          `\n\n(Showing lines ${offset}-${offset + limit - 1} of 10000000000. Use offset=${offset + limit} to continue.)`,
+          "utf-8",
+        ),
+        Buffer.byteLength(`\n\n(End of file - total 10000000000 lines)`, "utf-8"),
+      )
+      const overhead =
+        Buffer.byteLength(header, "utf-8") +
+        Buffer.byteLength("\n</content>", "utf-8") +
+        Buffer.byteLength(instructions, "utf-8") +
+        noticeReserve
+      const file = yield* lines(filepath, { limit, offset, overhead })
       if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
         return yield* Effect.fail(
           new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),

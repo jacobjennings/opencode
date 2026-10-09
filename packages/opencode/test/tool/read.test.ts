@@ -596,25 +596,73 @@ describe("tool.read caps", () => {
       const test = yield* TestInstance
       const p = path.join(test.directory, "wide.txt")
       // One long line truncates to 2000 chars + 34 char suffix = 2034 bytes, then
-      // 60 medium lines of 250 chars. Each medium line costs 251 bytes, so
-      // floor((16384 - 2034) / 251) = 57 of them fit and the cut lands on line 59.
-      // totalLines counts lines scanned up to the stop, which is the cut line itself.
+      // 60 medium lines of 250 chars. The full-output byte budget cuts a few lines
+      // before the medium block ends, and totalLines counts lines scanned up to the
+      // cut line itself.
       const lines = ["L".repeat(4000), ...Array.from({ length: 60 }, () => "m".repeat(250))]
       yield* put(p, lines.join("\n"))
 
       const result = yield* run({ filePath: p })
       expect(result.metadata.truncated).toBe(true)
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      const m = result.output.match(
+        /Output capped at 16 KB\. Showing lines 1-(\d+)\. Use offset=(\d+) to continue\./,
+      )
+      expect(m).not.toBeNull()
+      const shown = Number(m![1])
+      expect(Number(m![2])).toBe(shown + 1)
+      expect(shown).toBeGreaterThan(0)
+      expect(shown).toBeLessThan(61)
       expect(result.metadata.display).toMatchObject({
         type: "file",
         lineStart: 1,
-        lineEnd: 58,
-        totalLines: 59,
+        lineEnd: shown,
+        totalLines: shown + 1,
         truncated: true,
       })
-      expect(result.output).toContain("Output capped at 16 KB. Showing lines 1-58. Use offset=59 to continue.")
+      // the cut lands on a whole-line boundary
+      const numbered = result.output.match(/^\d+: .+$/gm) ?? []
+      expect(numbered.length).toBe(shown)
+      expect(numbered[0]).toContain("L".repeat(2000))
+      expect(numbered[0]).toHaveLength(3 + 2034)
+      expect(numbered.slice(1).every((line, i) => line === `${i + 2}: ` + "m".repeat(250))).toBe(true)
     }),
   )
 
+  it.instance("keeps the full file output within 16 KB including wrapper and notice", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const p = path.join(test.directory, "wide-lines.txt")
+      // 70 medium lines of 250 chars: raw content alone is about 17.5 KB, so a
+      // raw-only budget let the numbered, wrapped output drift past 16 KB.
+      yield* put(p, Array.from({ length: 70 }, () => "w".repeat(250)).join("\n"))
+
+      const result = yield* run({ filePath: p })
+      expect(result.metadata.truncated).toBe(true)
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      const m = result.output.match(
+        /Output capped at 16 KB\. Showing lines 1-(\d+)\. Use offset=(\d+) to continue\./,
+      )
+      expect(m).not.toBeNull()
+      const shown = Number(m![1])
+      expect(Number(m![2])).toBe(shown + 1)
+      expect(shown).toBeGreaterThan(0)
+      expect(shown).toBeLessThan(70)
+      expect(result.metadata.display).toMatchObject({
+        type: "file",
+        lineStart: 1,
+        lineEnd: shown,
+        totalLines: shown + 1,
+        truncated: true,
+      })
+      // the cut lands on a whole-line boundary
+      const numbered = result.output.match(/^\d+: .+$/gm) ?? []
+      expect(numbered.length).toBe(shown)
+      expect(numbered.every((line, i) => line === `${i + 1}: ` + "w".repeat(250))).toBe(true)
+    }),
+  )
+
+  // Compatibility guard: passes with or without the caps.
   it.instance("returns a small file whole with no notice", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -661,6 +709,7 @@ describe("tool.read caps", () => {
     }),
   )
 
+  // Compatibility guard: passes with or without the caps.
   it.instance("honours an explicit offset and limit inside the caps", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -682,6 +731,37 @@ describe("tool.read caps", () => {
       expect(result.output).not.toContain("150: line150")
       expect(result.output).toContain("Showing lines 100-149 of 1000")
       expect(result.output).toContain("Use offset=150")
+    }),
+  )
+
+  it.instance("keeps the full directory output within 16 KB and cuts on whole entries", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const dir = path.join(test.directory, "wide-dir")
+      const names = Array.from(
+        { length: 450 },
+        (_, i) => `dir-entry-${String(i).padStart(3, "0")}`.padEnd(61, "a") + ".txt",
+      )
+      yield* Effect.forEach(names, (name) => put(path.join(dir, name), "x"), { concurrency: 64 })
+
+      const result = yield* run({ filePath: dir, limit: 5000 })
+      expect(result.metadata.truncated).toBe(true)
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      expect(result.metadata.display).toMatchObject({
+        type: "directory",
+        totalEntries: 450,
+        truncated: true,
+      })
+      // the cut lands on whole entries, in list order
+      const entries = result.output.split("<entries>\n")[1].split("\n\n")[0].split("\n")
+      expect(entries.length).toBeGreaterThan(0)
+      expect(entries.length).toBeLessThan(450)
+      expect(entries.every((entry) => entry.length === 65)).toBe(true)
+      expect(entries).toEqual(names.slice(0, entries.length))
+      const m = result.output.match(/Showing (\d+) of 450 entries\. Use offset=(\d+) to continue\./)
+      expect(m).not.toBeNull()
+      expect(Number(m![1])).toBe(entries.length)
+      expect(Number(m![2])).toBe(entries.length + 1)
     }),
   )
 })
