@@ -17,6 +17,21 @@ const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const MAX_BYTES = 16 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
+const MAX_INSTRUCTION_BYTES = 8 * 1024
+const INSTRUCTION_NOTICE = "\n\n(Instructions truncated at 8 KB to keep this read result within 16 KB.)"
+
+function capBytes(text: string, max: number): string {
+  if (Buffer.byteLength(text, "utf-8") <= max) return text
+  let out = ""
+  let used = 0
+  for (const ch of text) {
+    const size = Buffer.byteLength(ch, "utf-8")
+    if (used + size > max) break
+    out += ch
+    used += size
+  }
+  return out
+}
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
 class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
@@ -364,10 +379,12 @@ export const ReadTool = Tool.define<
       // numbered content: the wrapper, the truncation notice (widest case), and
       // any loaded instructions, so the full output stays within MAX_BYTES.
       const header = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
-      const instructions =
-        loaded.length > 0
-          ? `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
-          : ""
+      const joined = loaded.map((item) => item.content).join("\n\n")
+      const body =
+        Buffer.byteLength(joined, "utf-8") > MAX_INSTRUCTION_BYTES
+          ? capBytes(joined, MAX_INSTRUCTION_BYTES - Buffer.byteLength(INSTRUCTION_NOTICE, "utf-8")) + INSTRUCTION_NOTICE
+          : joined
+      const instructions = loaded.length > 0 ? `\n\n<system-reminder>\n${body}\n</system-reminder>` : ""
       const noticeReserve = Math.max(
         Buffer.byteLength(
           `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${offset}-${offset + limit - 1}. Use offset=${offset + limit} to continue.)`,
@@ -408,9 +425,7 @@ export const ReadTool = Tool.define<
 
       yield* warm(filepath)
 
-      if (loaded.length > 0) {
-        output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
-      }
+      output += instructions
 
       return {
         title,
