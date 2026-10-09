@@ -17,7 +17,14 @@ import {
 } from "@opencode-ai/core/v1/session"
 
 import { NamedError } from "@opencode-ai/core/util/error"
-import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
+import {
+  APICallError,
+  convertToModelMessages,
+  InvalidResponseDataError,
+  LoadAPIKeyError,
+  type ModelMessage,
+  type UIMessage,
+} from "ai"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
@@ -696,6 +703,26 @@ export function fromError(
           responseHeaders: parsed.responseHeaders,
           responseBody: parsed.responseBody,
           metadata: parsed.metadata,
+        },
+        { cause: e },
+      ).toObject()
+    case InvalidResponseDataError.isInstance(e):
+      process.stderr.write(
+        JSON.stringify({
+          event: "openai-compat-invalid-response-data",
+          providerID: ctx.providerID,
+          message: e.message,
+          data: e.data ?? null,
+        }) + "\n",
+      )
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: true,
+          metadata: {
+            code: "invalid_response_data",
+            data: JSON.stringify(e.data ?? null),
+          },
         },
         { cause: e },
       ).toObject()
