@@ -14,6 +14,7 @@ import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
+import { SessionRetry } from "../../src/session/retry"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
@@ -94,6 +95,29 @@ function agent(): Agent.Info {
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
   }
 }
+
+const malformedToolCall = () =>
+  raw({
+    chunks: [
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { role: "assistant" } }],
+      },
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "" } }],
+            },
+          },
+        ],
+      },
+    ],
+  })
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -599,6 +623,93 @@ it.live("session.processor effect tests retry recognized structured json errors"
         expect(yield* llm.calls).toBe(2)
         expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
         expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor bounds malformed tool-call retries", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const max = SessionRetry.MALFORMED_TOOL_CALL_MAX_ATTEMPTS
+        yield* llm.push(...Array.from({ length: max }, () => malformedToolCall()))
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "tool" }],
+          tools: {},
+        })
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(max)
+        expect(handle.message.error?.name).toBe("APIError")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor recovers from malformed tool-call within budget", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const max = SessionRetry.MALFORMED_TOOL_CALL_MAX_ATTEMPTS
+        yield* llm.push(...Array.from({ length: max - 1 }, () => malformedToolCall()), reply().text("recovered").stop())
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "tool" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(max)
+        expect(parts.some((part) => part.type === "text" && part.text === "recovered")).toBe(true)
       }),
     { config: (url) => providerCfg(url) },
   ),

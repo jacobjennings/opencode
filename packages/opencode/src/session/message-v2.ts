@@ -607,6 +607,17 @@ export function latest(msgs: WithParts[]) {
   return { user, assistant, finished, tasks }
 }
 
+export const MALFORMED_TOOL_CALL_CODE = "malformed_tool_call"
+
+export function isMalformedStreamedToolCall(error: { message?: string }): boolean {
+  const message = error.message ?? ""
+  return (
+    message.includes("Expected 'function.name' to be a string") ||
+    message.includes("Expected 'id' to be a string") ||
+    message.includes("Expected 'function' type")
+  )
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
@@ -706,7 +717,8 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
-    case InvalidResponseDataError.isInstance(e):
+    case InvalidResponseDataError.isInstance(e): {
+      const malformed = isMalformedStreamedToolCall(e)
       process.stderr.write(
         JSON.stringify({
           event: "openai-compat-invalid-response-data",
@@ -720,12 +732,13 @@ export function fromError(
           message: e.message,
           isRetryable: true,
           metadata: {
-            code: "invalid_response_data",
+            code: malformed ? MALFORMED_TOOL_CALL_CODE : "invalid_response_data",
             data: JSON.stringify(e.data ?? null),
           },
         },
         { cause: e },
       ).toObject()
+    }
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:
