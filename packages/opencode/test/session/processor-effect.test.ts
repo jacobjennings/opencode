@@ -119,6 +119,34 @@ const malformedToolCall = () =>
     ],
   })
 
+const textThenMalformed = (text: string) =>
+  raw({
+    chunks: [
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { role: "assistant" } }],
+      },
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: text } }],
+      },
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "" } }],
+            },
+          },
+        ],
+      },
+    ],
+  })
+
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((done) => {
@@ -710,6 +738,50 @@ it.live("session.processor recovers from malformed tool-call within budget", () 
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(max)
         expect(parts.some((part) => part.type === "text" && part.text === "recovered")).toBe(true)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor does not duplicate text across a retried attempt", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.push(textThenMalformed("one"), reply().text("two").stop())
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "tool" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const textParts = parts.filter((part) => part.type === "text").map((part) => part.text)
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(textParts).toEqual(["two"])
       }),
     { config: (url) => providerCfg(url) },
   ),
