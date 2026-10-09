@@ -1474,6 +1474,20 @@ describe("session.message-v2.fromError", () => {
     expect(result.data.metadata?.code).toBe("invalid_response_data")
   })
 
+  test("does not leak the raw invalid response body into error metadata", () => {
+    const sentinel = "SECRET_SENTINEL_DO_NOT_LOG"
+    const input = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: sentinel } }] },
+      message: "Expected 'function.name' to be a string.",
+    })
+    const result = MessageV2.fromError(input, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.metadata?.code).toBe(MessageV2.MALFORMED_TOOL_CALL_CODE)
+    expect(result.data.metadata?.data).toBeUndefined()
+    expect(JSON.stringify(result.data.metadata ?? {})).not.toContain(sentinel)
+  })
+
   test("detects context overflow from APICallError provider messages", () => {
     const cases = [
       "prompt is too long: 213462 tokens > 200000 maximum",

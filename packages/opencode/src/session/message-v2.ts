@@ -724,7 +724,6 @@ export function fromError(
           event: "openai-compat-invalid-response-data",
           providerID: ctx.providerID,
           message: e.message,
-          data: e.data ?? null,
         }) + "\n",
       )
       return new APIError(
@@ -733,7 +732,6 @@ export function fromError(
           isRetryable: true,
           metadata: {
             code: malformed ? MALFORMED_TOOL_CALL_CODE : "invalid_response_data",
-            data: JSON.stringify(e.data ?? null),
           },
         },
         { cause: e },
