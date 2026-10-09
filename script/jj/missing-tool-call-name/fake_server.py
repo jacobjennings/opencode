@@ -10,6 +10,10 @@ reason (the stock build fails with "Expected 'function.name' to be a string").
 The next such request streams clean text "FAKE-DONE".
 MODE "late": the name arrives in a later delta of the same tool call, and the
 request after that streams clean text "FAKE-DONE".
+MODE "retry-text": the first tool-bearing attempt streams the fixed text
+"RETRY-TEXT-SENTINEL-7Q" and then a tool call with no function.name, ending the
+stream without a finish reason; every retried attempt streams the same fixed
+text and then finishes normally.
 
 Requests that carry no tools (e.g. title generation) get plain text and never
 emit tool calls. Every request body is appended to requests.jsonl.
@@ -19,7 +23,7 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT, OUT, MODE = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-state = {'n_tool_result': 0}
+state = {'n_tool_result': 0, 'n_stream_tools': 0}
 
 
 def chunk(delta, finish=None):
@@ -75,6 +79,26 @@ class H(BaseHTTPRequestHandler):
         if not req.get('tools'):
             # Streamed requests that carry no tools: title generation etc.
             self.send_stream([chunk({'role': 'assistant', 'content': 'fake title'}), chunk({}, 'stop')])
+            return
+        if MODE == 'retry-text':
+            # The first tool-bearing attempt streams a fixed text, then a malformed
+            # tool call with no function.name, and the stream ends without a finish
+            # reason. Every retried attempt streams the same fixed text and then
+            # finishes normally. This proves the retried attempt's text part is
+            # removed so the persisted session keeps the sentinel exactly once.
+            state['n_stream_tools'] += 1
+            if state['n_stream_tools'] == 1:
+                self.send_stream([
+                    chunk({'role': 'assistant', 'content': 'RETRY-TEXT-SENTINEL-7Q'}),
+                    chunk({'tool_calls': [{'index': 0, 'type': 'function',
+                                            'function': {'arguments': ''}}]}),
+                    chunk({'tool_calls': [{'index': 0, 'function': {'arguments': args}}]}),
+                ], tail=False)
+            else:
+                self.send_stream([
+                    chunk({'role': 'assistant', 'content': 'RETRY-TEXT-SENTINEL-7Q'}),
+                    chunk({}, 'stop'),
+                ])
             return
         if has_tool_result:
             state['n_tool_result'] += 1
