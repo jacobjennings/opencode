@@ -355,7 +355,7 @@ export const ReadTool = Tool.define<
         loaded.length > 0
           ? `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
           : ""
-      const notice =
+      const detailedNotice =
         loaded.length > 0
           ? `\n\n<system-reminder>\n${loaded
               .map(
@@ -364,6 +364,12 @@ export const ReadTool = Tool.define<
               )
               .join("\n")}\n</system-reminder>`
           : ""
+
+      // Deep instruction paths can make the notice itself exceed the cap. Keep most of the budget for the file.
+      const notice =
+        Buffer.byteLength(detailedNotice, "utf-8") <= MAX_BYTES / 4
+          ? detailedNotice
+          : `\n\n<system-reminder>\nInstructions from ${loaded.length} files were left out because this read is capped at ${MAX_BYTES_LABEL}. Read the instruction files in this file's parent directories with offset and limit to see them.\n</system-reminder>`
 
       const file = yield* lines(filepath, {
         limit,

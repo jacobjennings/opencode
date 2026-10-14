@@ -680,6 +680,27 @@ describe("tool.read output cap", () => {
   )
 })
 
+describe("tool.read instruction notice budget", () => {
+  it.live("caps notices from many deep instruction paths and preserves file content", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      let nested = dir
+      for (let i = 0; i < 20; i++) {
+        nested = path.join(nested, `${i}-${"d".repeat(150)}`)
+        yield* put(path.join(nested, "AGENTS.md"), "Instruction.\n".repeat(2000))
+      }
+      const target = path.join(nested, "test.txt")
+      yield* put(target, "test content")
+      const result = yield* exec(dir, { filePath: target })
+      expect(result.metadata.loaded).toHaveLength(20)
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+      expect(result.output).toContain("1: test content")
+      expect(result.output).toContain("Instructions from 20 files were left out")
+      expect(result.output).toContain("parent directories with offset and limit")
+    }),
+  )
+})
+
 describe("tool.read loaded instructions", () => {
   it.live("loads AGENTS.md from parent directory and includes in metadata", () =>
     Effect.gen(function* () {
