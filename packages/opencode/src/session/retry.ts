@@ -40,6 +40,8 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
 
+export const MALFORMED_TOOL_CALL_MAX_ATTEMPTS = 3
+
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
@@ -180,6 +182,11 @@ function parseJSON(value: unknown) {
   })
 }
 
+function isMalformedToolCallRetry(error: Err) {
+  if (!SessionV1.APIError.isInstance(error)) return false
+  return error.data.metadata?.code === MessageV2.MALFORMED_TOOL_CALL_CODE
+}
+
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
@@ -188,6 +195,9 @@ export function policy(opts: {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
+      if (isMalformedToolCallRetry(error) && meta.attempt >= MALFORMED_TOOL_CALL_MAX_ATTEMPTS) {
+        return Cause.done(meta.attempt)
+      }
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
       if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)

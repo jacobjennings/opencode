@@ -17,7 +17,14 @@ import {
 } from "@opencode-ai/core/v1/session"
 
 import { NamedError } from "@opencode-ai/core/util/error"
-import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
+import {
+  APICallError,
+  convertToModelMessages,
+  InvalidResponseDataError,
+  LoadAPIKeyError,
+  type ModelMessage,
+  type UIMessage,
+} from "ai"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
@@ -616,6 +623,17 @@ function isAfter(info: Info, other?: Info) {
   return info.id > other.id
 }
 
+export const MALFORMED_TOOL_CALL_CODE = "malformed_tool_call"
+
+export function isMalformedStreamedToolCall(error: { message?: string }): boolean {
+  const message = error.message ?? ""
+  return (
+    message.includes("Expected 'function.name' to be a string") ||
+    message.includes("Expected 'id' to be a string") ||
+    message.includes("Expected 'function' type")
+  )
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
@@ -715,6 +733,26 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case InvalidResponseDataError.isInstance(e): {
+      const malformed = isMalformedStreamedToolCall(e)
+      process.stderr.write(
+        JSON.stringify({
+          event: "openai-compat-invalid-response-data",
+          providerID: ctx.providerID,
+          message: e.message,
+        }) + "\n",
+      )
+      return new APIError(
+        {
+          message: e.message,
+          isRetryable: malformed,
+          metadata: {
+            code: malformed ? MALFORMED_TOOL_CALL_CODE : "invalid_response_data",
+          },
+        },
+        { cause: e },
+      ).toObject()
+    }
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:

@@ -146,6 +146,35 @@ describe("session.retry.delay", () => {
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
     }),
   )
+
+  it.instance("halts malformed tool-call retries at the attempt budget", () =>
+    Effect.gen(function* () {
+      const malformed = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Expected 'function.name' to be a string",
+          isRetryable: true,
+          responseHeaders: { "retry-after-ms": "0" },
+          metadata: { code: MessageV2.MALFORMED_TOOL_CALL_CODE },
+        }).toObject(),
+      )
+      const seen: number[] = []
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: () => malformed,
+          set: (info) => {
+            seen.push(info.attempt)
+            return Effect.void
+          },
+        }),
+      )
+      for (let i = 0; i < SessionRetry.MALFORMED_TOOL_CALL_MAX_ATTEMPTS + 3; i++) {
+        const result = yield* Effect.option(step("streamed tool call without function.name"))
+        if (result._tag === "None") break
+      }
+      expect(seen).toEqual([1, SessionRetry.MALFORMED_TOOL_CALL_MAX_ATTEMPTS - 1])
+    }),
+  )
 })
 
 describe("session.retry.retryable", () => {
