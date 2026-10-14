@@ -1,0 +1,30 @@
+#!/bin/bash
+# usage: run.sh OPENCODE_BINARY LABEL -> runs one opencode turn against the fake server
+# in a fully temporary HOME/XDG tree, prints the exit code and the markers seen.
+set -u
+bin=$1; label=$2; port=${3:-18931}
+here=$(cd "$(dirname "$0")" && pwd)
+work=$(mktemp -d "$here/run-$label-XXXXXX")
+mkdir -p "$work/home" "$work/xdg/config/opencode" "$work/xdg/data" "$work/xdg/cache" "$work/xdg/state" "$work/proj"
+cat > "$work/xdg/config/opencode/opencode.json" <<EOF
+{"\$schema":"https://opencode.ai/config.json","autoupdate":false,"share":"disabled",
+ "model":"fake/fake-model","small_model":"fake/fake-model",
+ "permission":{"bash":"allow","edit":"allow"},
+ "provider":{"fake":{"npm":"@ai-sdk/openai-compatible","name":"fake",
+   "options":{"baseURL":"http://127.0.0.1:$port/v1","apiKey":"x"},
+   "models":{"fake-model":{"name":"fake-model","tool_call":true}}}}}
+EOF
+python3 -I "$here/fake_server.py" "$port" "$work" & srv=$!
+sleep 1
+( cd "$work/proj" && git init -q . && env -i PATH=/usr/bin:/bin HOME="$work/home" \
+  XDG_CONFIG_HOME="$work/xdg/config" XDG_DATA_HOME="$work/xdg/data" XDG_CACHE_HOME="$work/xdg/cache" \
+  XDG_STATE_HOME="$work/xdg/state" OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
+  CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES=void \
+  timeout 120 "$bin" run --model fake/fake-model "run the marker command" < /dev/null > "$work/out.txt" 2> "$work/err.txt" )
+rc=$?
+kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+echo "$label rc=$rc work=$work"
+echo "  streamed requests: $(grep -c '"stream": *true\|"stream":true' "$work/requests.jsonl" 2>/dev/null)"
+echo "  id error lines: $(cat "$work/out.txt" "$work/err.txt" | grep -c "Expected 'id' to be a string")"
+echo "  tool ran: $(cat "$work/out.txt" "$work/err.txt" | grep -c 'FAKE-TOOL-RAN')"
+echo "  final text: $(grep -c 'FAKE-DONE' "$work/out.txt")"

@@ -72,6 +72,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  attemptTextParts: PartID[]
 }
 
 type StreamEvent = LLMEvent
@@ -111,6 +112,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        attemptTextParts: [],
       }
       let aborted = false
 
@@ -507,6 +509,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.attemptTextParts.push(ctx.currentText.id)
             yield* session.updatePart(ctx.currentText)
             return
 
@@ -648,6 +651,14 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            for (const partID of ctx.attemptTextParts) {
+              yield* session.removePart({
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                partID,
+              })
+            }
+            ctx.attemptTextParts = []
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { createXai } from "@ai-sdk/xai"
-import { APICallError, generateText } from "ai"
+import { APICallError, generateText, InvalidResponseDataError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
@@ -1631,6 +1631,67 @@ describe("session.message-v2.fromError", () => {
         responseBody: JSON.stringify(body),
       },
     })
+  })
+
+  test("classifies malformed streamed tool-call as malformed_tool_call", () => {
+    const input = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "{}" } }] },
+      message: "Expected 'function.name' to be a string.",
+    })
+    const result = MessageV2.fromError(input, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.metadata?.code).toBe(MessageV2.MALFORMED_TOOL_CALL_CODE)
+    expect(result.data.isRetryable).toBe(true)
+  })
+
+  test("classifies missing tool-call id as malformed_tool_call", () => {
+    const input = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, type: "function", function: { name: "bash", arguments: "{}" } }] },
+      message: "Expected 'id' to be a string.",
+    })
+    const result = MessageV2.fromError(input, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.metadata?.code).toBe(MessageV2.MALFORMED_TOOL_CALL_CODE)
+  })
+
+  test("classifies generic invalid-response-data as invalid_response_data", () => {
+    const input = new InvalidResponseDataError({ data: { choices: [] }, message: "Response did not contain any choices." })
+    const result = MessageV2.fromError(input, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.metadata?.code).toBe("invalid_response_data")
+  })
+
+  test("does not leak the raw invalid response body into error metadata", () => {
+    const sentinel = "SECRET_SENTINEL_DO_NOT_LOG"
+    const input = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: sentinel } }] },
+      message: "Expected 'function.name' to be a string.",
+    })
+    const result = MessageV2.fromError(input, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) return
+    expect(result.data.metadata?.code).toBe(MessageV2.MALFORMED_TOOL_CALL_CODE)
+    expect(result.data.metadata?.data).toBeUndefined()
+    expect(JSON.stringify(result.data.metadata ?? {})).not.toContain(sentinel)
+  })
+
+  test("only retries malformed streamed tool calls, not generic invalid response data", () => {
+    const malformed = new InvalidResponseDataError({
+      data: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "{}" } }] },
+      message: "Expected 'function.name' to be a string.",
+    })
+    const generic = new InvalidResponseDataError({ data: { choices: [] }, message: "Response did not contain any choices." })
+
+    const retryable = MessageV2.fromError(malformed, { providerID })
+    expect(SessionV1.APIError.isInstance(retryable)).toBe(true)
+    if (SessionV1.APIError.isInstance(retryable)) expect(retryable.data.isRetryable).toBe(true)
+
+    const notRetryable = MessageV2.fromError(generic, { providerID })
+    expect(SessionV1.APIError.isInstance(notRetryable)).toBe(true)
+    if (SessionV1.APIError.isInstance(notRetryable)) expect(notRetryable.data.isRetryable).toBe(false)
   })
 
   test("detects context overflow from APICallError provider messages", () => {
