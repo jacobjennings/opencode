@@ -316,9 +316,8 @@ describe("tool.read truncation", () => {
   it.instance("truncates large file by bytes and sets truncated metadata", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      const base = yield* load(path.join(FIXTURES_DIR, "models-api.json"))
-      const target = 60 * 1024
-      const content = base.length >= target ? base : base.repeat(Math.ceil(target / base.length))
+      // Lines of 1000 characters, so the 16 KB byte cap cuts before the 400 line cap does.
+      const content = Array.from({ length: 60 }, () => "x".repeat(1000)).join("\n")
       yield* put(path.join(test.directory, "large.json"), content)
 
       const result = yield* run({ filePath: path.join(test.directory, "large.json") })
@@ -563,6 +562,120 @@ root_type Monster;`
         expect(result.attachments).toBeUndefined()
         expect(result.output).toContain(item[1])
       }
+    }),
+  )
+})
+
+// One read result is capped at 400 lines and 16 KB, wrappers and notices included (Director ruling, 14 October 2026).
+describe("tool.read output cap", () => {
+  it.live("cuts a file over the line cap and says where to continue", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = Array.from({ length: 1000 }, (_, i) => `line${i + 1}`).join("\n")
+      yield* put(path.join(dir, "long.txt"), lines)
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "long.txt") })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.output).toContain("Showing lines 1-400 of 1000")
+      expect(result.output).toContain("Use offset=401 to continue")
+      expect(result.output).toContain("400: line400")
+      expect(result.output).not.toContain("401: line401")
+    }),
+  )
+
+  it.live("cuts a file over the byte cap, with one very long line, and says where to continue", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      // The first line is cut to the per-line limit. The rest sit just under it, so the byte cap cuts before the line cap.
+      const lines = ["a".repeat(3000), ...Array.from({ length: 40 }, () => "b".repeat(1900))].join("\n")
+      yield* put(path.join(dir, "wide.txt"), lines)
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "wide.txt") })
+      const cut = result.output.match(/Showing lines 1-(\d+)\. Use offset=(\d+) to continue/)
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.output).toContain("Output capped at 16 KB")
+      expect(result.output).toContain("(line truncated to 2000 chars)")
+      expect(Number(cut?.[1])).toBeGreaterThan(1)
+      expect(Number(cut?.[1])).toBeLessThan(41)
+      expect(cut?.[2]).toBe(String(Number(cut?.[1]) + 1))
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+    }),
+  )
+
+  it.live("cuts a directory listing at the byte cap and says where to continue", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const names = Array.from({ length: 300 }, (_, i) => `${String(i).padStart(3, "0")}-${"n".repeat(80)}.txt`)
+      yield* Effect.forEach(names, (name) => put(path.join(dir, "many", name), "x"), { concurrency: "unbounded" })
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "many") })
+      const cut = result.output.match(
+        /Showing (\d+) of 300 entries\. Use 'offset' parameter to read beyond entry (\d+)/,
+      )
+      expect(result.metadata.truncated).toBe(true)
+      expect(cut?.[2]).toBe(String(Number(cut?.[1]) + 1))
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
+    }),
+  )
+
+  // Compatibility guard: passes on both sides of the cap change.
+  it.live("returns a file under both caps whole", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = Array.from({ length: 399 }, (_, i) => `line${i + 1}`).join("\n")
+      yield* put(path.join(dir, "whole.txt"), lines)
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "whole.txt") })
+      expect(result.metadata.truncated).toBe(false)
+      expect(result.output).toContain("399: line399")
+      expect(result.output).toContain("End of file - total 399 lines")
+    }),
+  )
+
+  // Compatibility guard: passes on both sides of the cap change.
+  it.live("honours an explicit offset and limit inside the cap", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = Array.from({ length: 1000 }, (_, i) => `line${i + 1}`).join("\n")
+      yield* put(path.join(dir, "window.txt"), lines)
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "window.txt"), offset: 50, limit: 300 })
+      expect(result.output).toContain("Showing lines 50-349 of 1000")
+      expect(result.output).toContain("Use offset=350 to continue")
+      expect(result.output).toContain("50: line50")
+      expect(result.output).toContain("349: line349")
+      expect(result.output).not.toContain("350: line350")
+    }),
+  )
+
+  it.live("cuts a limit above the line cap to the cap", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = Array.from({ length: 1000 }, (_, i) => `line${i + 1}`).join("\n")
+      yield* put(path.join(dir, "above.txt"), lines)
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "above.txt"), limit: 5000 })
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.output).toContain("Showing lines 1-400 of 1000")
+      expect(result.output).toContain("Use offset=401 to continue")
+    }),
+  )
+
+  it.live("gives a notice for an oversized instruction file and still returns the file", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const instructions = path.join(dir, "subdir", "AGENTS.md")
+      yield* put(instructions, `# Big Instructions\n${"Do something special.\n".repeat(1000)}`)
+      yield* put(path.join(dir, "subdir", "nested", "test.txt"), "test content")
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "subdir", "nested", "test.txt") })
+      expect(result.output).toContain("1: test content")
+      expect(result.output).toContain("were left out")
+      expect(result.output).toContain(instructions)
+      expect(result.output).toMatch(/\(\d+ bytes\)/)
+      expect(result.output).toContain("Read that file with offset and limit")
+      expect(result.output).not.toContain("Do something special")
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(16 * 1024)
     }),
   )
 })

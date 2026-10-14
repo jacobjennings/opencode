@@ -10,15 +10,30 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 
-const DEFAULT_READ_LIMIT = 2000
+const MAX_READ_LINES = 400
 const MAX_LINE_LENGTH = 2000
 const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
-const MAX_BYTES = 50 * 1024
+// One read result, including its wrappers, notices and instructions, stays within this many bytes.
+const MAX_BYTES = 16 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
+// Room left for the closing notice and tag, which are written after the cap is applied.
+const TRAILER_RESERVE = 256
 const SAMPLE_BYTES = 4096
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
 class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
+
+// How many leading directory entries fit in the byte budget, counting the newline that joins each one.
+function fitLines(items: string[], budget: number) {
+  let used = 0
+  let count = 0
+  for (const item of items) {
+    used += Buffer.byteLength(item, "utf-8") + (count > 0 ? 1 : 0)
+    if (used > budget) break
+    count += 1
+  }
+  return count
+}
 
 // `offset` and `limit` were originally `z.coerce.number()` — the runtime
 // coercion was useful when the tool was called from a shell but serves no
@@ -31,7 +46,7 @@ export const Parameters = Schema.Struct({
     description: "The line number to start reading from (1-indexed)",
   }),
   limit: Schema.optional(NonNegativeInt).annotate({
-    description: "The maximum number of lines to read (defaults to 2000)",
+    description: "The maximum number of lines to read (defaults to 400, the most one read returns)",
   }),
 })
 
@@ -134,7 +149,10 @@ export const ReadTool = Tool.define<
       )
     })
 
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
+    const lines = Effect.fn("ReadTool.lines")(function* (
+      filepath: string,
+      opts: { limit: number; offset: number; bytes: number },
+    ) {
       const start = opts.offset - 1
       const raw: string[] = []
       const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
@@ -160,8 +178,9 @@ export const ReadTool = Tool.define<
             }
 
             const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-            if (flags.bytes + size <= MAX_BYTES) {
+            // Count the line as it is printed: its `<n>: ` prefix and the newline that joins it.
+            const size = Buffer.byteLength(`${flags.count}: ${line}`, "utf-8") + (raw.length > 0 ? 1 : 0)
+            if (flags.bytes + size <= opts.bytes) {
               raw.push(line)
               flags.bytes += size
               return
@@ -261,20 +280,21 @@ export const ReadTool = Tool.define<
 
       if (!stat) return yield* miss(filepath)
 
+      // A limit above the cap is cut to the cap, so one read never returns more than MAX_READ_LINES lines.
+      const limit = Math.min(params.limit ?? MAX_READ_LINES, MAX_READ_LINES)
       if (stat.type === "Directory") {
         const items = yield* list(filepath)
-        const limit = params.limit ?? DEFAULT_READ_LIMIT
         const offset = params.offset || 1
         const start = offset - 1
-        const sliced = items.slice(start, start + limit)
+        const head = [`<path>${filepath}</path>`, `<type>directory</type>`, `<entries>`].join("\n")
+        const page = items.slice(start, start + limit)
+        const sliced = page.slice(0, fitLines(page, MAX_BYTES - Buffer.byteLength(head) - TRAILER_RESERVE))
         const truncated = start + sliced.length < items.length
 
         return {
           title,
           output: [
-            `<path>${filepath}</path>`,
-            `<type>directory</type>`,
-            `<entries>`,
+            head,
             sliced.join("\n"),
             truncated
               ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
@@ -328,14 +348,35 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+      // The file gets the cap first. Instructions are appended only if the whole result still fits, and the notice
+      // that replaces them is reserved up front so it always fits.
+      const header = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      const reminder =
+        loaded.length > 0
+          ? `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
+          : ""
+      const notice =
+        loaded.length > 0
+          ? `\n\n<system-reminder>\n${loaded
+              .map(
+                (item) =>
+                  `Instructions from ${item.filepath} (${Buffer.byteLength(item.content, "utf-8")} bytes) were left out because this read is capped at ${MAX_BYTES_LABEL}. Read that file with offset and limit to see them.`,
+              )
+              .join("\n")}\n</system-reminder>`
+          : ""
+
+      const file = yield* lines(filepath, {
+        limit,
+        offset: params.offset || 1,
+        bytes: MAX_BYTES - Buffer.byteLength(header) - TRAILER_RESERVE - Buffer.byteLength(notice),
+      })
       if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
         return yield* Effect.fail(
           new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      let output = header
       output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
 
       const last = file.offset + file.raw.length - 1
@@ -352,9 +393,7 @@ export const ReadTool = Tool.define<
 
       yield* warm(filepath)
 
-      if (loaded.length > 0) {
-        output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
-      }
+      output += Buffer.byteLength(output + reminder, "utf-8") <= MAX_BYTES ? reminder : notice
 
       return {
         title,
